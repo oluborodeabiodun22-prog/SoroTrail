@@ -237,6 +237,14 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 	return p.upsertEvents(ctx, events, false)
 }
 
+func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("pruning events before %s: %w", cutoff.Format(time.RFC3339Nano), err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
 // Both paths write the full events row so raw XDR is never silently dropped
@@ -244,6 +252,7 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // stored via the coalesce() clauses in the UPDATE branch (`sorotrail replay`
 // relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	batch := &pgx.Batch{}
 	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
 	if onUpdate {
 		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
@@ -267,7 +276,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			 raw_topic_xdr, raw_value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		` + conflict
-	batch := &pgx.Batch{}
 	for _, e := range events {
 		// 14 placeholders → 14 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
@@ -1220,15 +1228,15 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, network string, 
 // "watched since" — the earliest claim is what ingestion has actually been
 // following.
 const watchedContractsUnion = `
-	SELECT contract_id, min(added_at) AS added_at FROM (
-		SELECT contract_id, added_at FROM watched_contracts
+	SELECT network, contract_id, min(added_at) AS added_at FROM (
+		SELECT network, contract_id, added_at FROM watched_contracts
 		UNION ALL
-		SELECT contract_id, added_at FROM tenant_watched_contracts
-	) w GROUP BY contract_id`
+		SELECT network, contract_id, added_at FROM tenant_watched_contracts
+	) w GROUP BY network, contract_id`
 
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
-		watchedContractsUnion+` ORDER BY contract_id`)
+		watchedContractsUnion+` ORDER BY network, contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -1237,7 +1245,7 @@ func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract,
 	var out []WatchedContract
 	for rows.Next() {
 		var wc WatchedContract
-		if err := rows.Scan(&wc.ContractID, &wc.AddedAt); err != nil {
+		if err := rows.Scan(&wc.Network, &wc.ContractID, &wc.AddedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, wc)
@@ -1245,13 +1253,15 @@ func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract,
 	return out, rows.Err()
 }
 
-// RemoveWatchedContract stops future ingestion for the given contract by
-// removing its row from watched_contracts. It does NOT delete any event
-// rows already in storage — those remain queryable. ErrNotFound signals a
-// typo so the API can respond 404.
-func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string) error {
+// RemoveWatchedContract stops future ingestion for the given contract on
+// the given network by removing its row from watched_contracts. It does
+// NOT delete any event rows already in storage — those remain queryable.
+// ErrNotFound signals a typo in either half of the (network, contract)
+// pair so the API can respond 404.
+func (p *Postgres) RemoveWatchedContract(ctx context.Context, w WatchedContract) error {
 	tag, err := p.pool.Exec(ctx,
-		`DELETE FROM watched_contracts WHERE contract_id = $1`, contractID)
+		`DELETE FROM watched_contracts WHERE network = $1 AND contract_id = $2`,
+		defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("removing watched contract: %w", err)
 	}
@@ -1261,10 +1271,11 @@ func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string)
 	return nil
 }
 
-func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {
+func (p *Postgres) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO watched_contracts (contract_id) VALUES ($1)
-		ON CONFLICT (contract_id) DO NOTHING`, contractID)
+		INSERT INTO watched_contracts (network, contract_id) VALUES ($1, $2)
+		ON CONFLICT (network, contract_id) DO NOTHING`,
+		defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
@@ -1597,6 +1608,45 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 	)
 	if err != nil {
 		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
+	}
+	return nil
+}
+
+func (p *Postgres) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	var specJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	).Scan(&specJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec override for %s: %w", contractID, err)
+	}
+	return specJSON, nil
+}
+
+func (p *Postgres) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			updated_at = now()`,
+		contractID, specJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	_, err := p.pool.Exec(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	)
+	if err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
 	}
 	return nil
 }

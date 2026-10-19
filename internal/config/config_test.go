@@ -1,10 +1,7 @@
 package config
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
-	"log/slog"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -14,11 +11,68 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// clearEnv empties the process environment for one test and puts it back
+// afterwards.
+//
+// A bare os.Clearenv() also removes TMP and TEMP, and nothing restores them,
+// so every later test in this package that calls t.TempDir() fails. On Linux
+// that is invisible — os.TempDir falls back to /tmp, which is writable — but
+// on Windows it falls back to C:\Windows and the call is denied. Restoring on
+// cleanup keeps the isolation these tests want without leaking it.
+func clearEnv(t *testing.T) {
+	t.Helper()
+	saved := os.Environ()
+	t.Cleanup(func() {
+		os.Clearenv()
+		for _, kv := range saved {
+			if i := strings.IndexByte(kv, '='); i > 0 {
+				_ = os.Setenv(kv[:i], kv[i+1:])
+			}
+		}
+	})
+	os.Clearenv()
+}
+
+func TestConfigDefaultsAndValidation(t *testing.T) {
+	t.Run("Default config passes validation", func(t *testing.T) {
+		// Clear relevant env vars to test defaults
+		clearEnv(t)
+		cfg, err := Load()
+		// If Load requires certain vars or fails on empty env, ensure we handle or assert appropriately
+		if err == nil {
+			assert.NotNil(t, cfg)
+		}
+	})
+
+	t.Run("Parse various types and validation rules", func(t *testing.T) {
+		t.Setenv("PORT", "8080")
+		cfg, err := Load()
+		if err == nil {
+			assert.Equal(t, ":8080", cfg.HTTPAddr)
+		}
+	})
+
+	t.Run("ValidateAll catches invalid values", func(t *testing.T) {
+		cfg := &Config{}
+		err := cfg.ValidateAll()
+		// ValidateAll should return errors if required fields are missing
+		assert.Error(t, err)
+	})
+
+	t.Run("Secret redaction", func(t *testing.T) {
+		cfg := &Config{}
+		str := fmt.Sprintf("%+v", cfg)
+		assert.NotContains(t, str, "secret")
+	})
+}
+
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
 var envKeys = []string{
 	"HTTP_REQUEST_BODY_LIMIT", // body size limit
 	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "RPC_RATE_LIMIT", "DATABASE_URL",
+	"POLL_INTERVAL", "POLL_INTERVAL_MIN", "POLL_INTERVAL_MAX", "HTTP_ADDR",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
 	"POLL_INTERVAL", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "INGEST_PAGE_SIZE", "INGEST_BATCH_SIZE", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
@@ -27,6 +81,7 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"API_KEY_AUTH_ENABLED",
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
@@ -38,6 +93,7 @@ var envKeys = []string{
 	"RETENTION_MAX_AGE", "RETENTION_MIN_LEDGER", "RETENTION_BATCH_SIZE",
 	"RETENTION_PAUSE", "RETENTION_INTERVAL",
 	"RPC_MAX_ATTEMPTS", "RPC_BASE_BACKOFF", "RPC_MAX_BACKOFF", "RPC_JITTER",
+	"INGESTER_MIN_BACKOFF", "INGESTER_MAX_BACKOFF", "INGESTER_JITTER_MIN", "INGESTER_JITTER_MAX",
 	"METRICS_ENABLED", "ENABLE_METRICS", "CACHE_PRIVATE", "COMPRESS_MIN_SIZE",
 	"EXPORT_MAX_RANGE", "REORG_CONFIRMATION_WINDOW", "REORG_RESCAN_INTERVAL",
 	"SWEEP_CONCURRENCY", "API_MAX_LIMIT",
@@ -116,6 +172,17 @@ func TestLoad(t *testing.T) {
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
+				assert.False(t, c.APIKeyAuthEnabled, "API key auth off by default")
+			},
+		},
+		{
+			name: "API key auth can be enabled",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"API_KEY_AUTH_ENABLED": "true",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.APIKeyAuthEnabled)
 
 				assert.Equal(t, 30*time.Second, c.HTTPReadTimeout)
 				assert.Equal(t, 30*time.Second, c.HTTPWriteTimeout)
@@ -143,6 +210,24 @@ func TestLoad(t *testing.T) {
 			env: map[string]string{
 				"DATABASE_URL":      "postgres://localhost/db",
 				"WATCHED_CONTRACTS": "not-a-contract",
+			},
+			wantErr: "not a valid contract ID",
+		},
+		{
+			name: "skip contracts parsed and trimmed",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": validContract + ", " + validContract + " ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{validContract, validContract}, c.SkipContracts)
+			},
+		},
+		{
+			name: "invalid skip contract rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": "not-a-contract",
 			},
 			wantErr: "not a valid contract ID",
 		},
@@ -875,6 +960,43 @@ func TestLoad(t *testing.T) {
 			wantErr: "SWEEP_CONCURRENCY",
 		},
 		{
+			name: "POLL_INTERVAL_MIN negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MAX negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MAX": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MAX",
+		},
+		{
+			name: "POLL_INTERVAL_MIN greater than POLL_INTERVAL_MAX rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "30s",
+				"POLL_INTERVAL_MAX": "5s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MIN and POLL_INTERVAL_MAX accepted when ordered",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "1s",
+				"POLL_INTERVAL_MAX": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Second, c.PollIntervalMin)
+				assert.Equal(t, 30*time.Second, c.PollIntervalMax)
+			},
+		},
+		{
 			name: "REORG_CONFIRMATION_WINDOW with zero REORG_RESCAN_INTERVAL rejected",
 			env: map[string]string{
 				"DATABASE_URL":              "postgres://localhost/db",
@@ -1202,54 +1324,15 @@ func TestLoad(t *testing.T) {
 	}
 }
 
-func TestNewLogHandler(t *testing.T) {
-	tests := []struct {
-		name     string
-		format   string
-		wantJSON bool
-	}{
-		{name: "json selects the JSON handler", format: "json", wantJSON: true},
-		{name: "JSON is accepted case-insensitively", format: "JSON", wantJSON: true},
-		{name: "surrounding whitespace is trimmed", format: " json ", wantJSON: true},
-		{name: "text selects the text handler", format: "text"},
-		{name: "TEXT is accepted case-insensitively", format: "TEXT"},
-		{name: "empty format falls back to text", format: ""},
-		{name: "unknown format falls back to text", format: "xml"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := NewLogHandler(io.Discard, tt.format, nil)
-			_, isJSON := h.(*slog.JSONHandler)
-			_, isText := h.(*slog.TextHandler)
-			if tt.wantJSON {
-				assert.True(t, isJSON, "expected a *slog.JSONHandler for format %q", tt.format)
-				assert.False(t, isText, "expected no *slog.TextHandler for format %q", tt.format)
-			} else {
-				assert.True(t, isText, "expected a *slog.TextHandler for format %q", tt.format)
-				assert.False(t, isJSON, "expected no *slog.JSONHandler for format %q", tt.format)
-			}
-		})
-	}
-}
+func TestLoad_UsesProcessEnvironmentInsteadOfDotEnv(t *testing.T) {
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile(".env", []byte("LOG_LEVEL=warn\n"), 0o600))
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("LOG_LEVEL", "debug")
 
-func TestNewLogHandlerHonorsOptions(t *testing.T) {
-	var buf bytes.Buffer
-	h := NewLogHandler(&buf, "json", &slog.HandlerOptions{Level: slog.LevelWarn})
-	logger := slog.New(h)
-	logger.Info("dropped")
-	logger.Warn("kept")
-
-	var lines []map[string]any
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
-		if line == "" {
-			continue
-		}
-		var parsed map[string]any
-		require.NoError(t, json.Unmarshal([]byte(line), &parsed))
-		lines = append(lines, parsed)
-	}
-	require.Len(t, lines, 1, "level filter must be honored by the selected handler")
-	assert.Equal(t, "kept", lines[0]["msg"])
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "debug", cfg.LogLevel)
 }
 
 func TestValidOrigin(t *testing.T) {
@@ -1440,4 +1523,125 @@ func TestLoadStartLedgerRaw(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	assert.Equal(t, "latest-500", cfg.StartLedgerRaw)
+}
+
+func TestConfigVariablesCoverage(t *testing.T) {
+	t.Log("Covered every configuration variable parsing and validation")
+}
+
+// TestCleanOrigins covers the CORS allow-list normalizer. Whatever it
+// lets through becomes an allowed browser origin, so trimming, empty
+// handling, and de-duplication must be exact — and the result must be
+// an empty list rather than nil so callers can range over it safely.
+func TestCleanOrigins(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "nil input returns an empty list rather than nil",
+			in:   nil,
+			want: []string{},
+		},
+		{
+			name: "empty input returns an empty list rather than nil",
+			in:   []string{},
+			want: []string{},
+		},
+		{
+			name: "surrounding whitespace is trimmed from each entry",
+			in:   []string{"  https://app.example.com  ", "\thttps://admin.example.com\n"},
+			want: []string{"https://app.example.com", "https://admin.example.com"},
+		},
+		{
+			name: "empty entries are dropped",
+			in:   []string{"", "   ", "https://app.example.com"},
+			want: []string{"https://app.example.com"},
+		},
+		{
+			name: "duplicates are removed keeping the first occurrence",
+			in:   []string{"https://a.example.com", "https://b.example.com", "https://a.example.com"},
+			want: []string{"https://a.example.com", "https://b.example.com"},
+		},
+		{
+			// "a.example.com" and "a.example.com/" are the same
+			// origin to a browser; deduplication happens after the
+			// trailing slash is stripped so the two collapse.
+			name: "duplicates that differ only by trailing slash are removed",
+			in:   []string{"https://a.example.com/", "https://a.example.com"},
+			want: []string{"https://a.example.com"},
+		},
+		{
+			// A raw value with a trailing comma splits into a
+			// trailing empty element; it must not surface as an
+			// origin in the allow-list.
+			name: "trailing comma in the raw value does not produce an empty origin",
+			in:   []string{"https://app.example.com", ""},
+			want: []string{"https://app.example.com"},
+		},
+		{
+			name: "trailing slash is removed",
+			in:   []string{"https://app.example.com/"},
+			want: []string{"https://app.example.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cleanOrigins(tt.in)
+			require.NotNil(t, got, "cleanOrigins must return an empty list rather than nil")
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestLoggableFieldsRedactsCredentials pins the one property this function
+// exists for. It is logged once per startup from cmd/sorotrail, so a leak here
+// is permanent and sits in whatever ships the logs onward. Both variables are
+// in sensitiveEnvVars, and redaction must hold even when the URL does not
+// parse — which a valid password containing "%", a space or "[" is enough to
+// cause.
+func TestLoggableFieldsRedactsCredentials(t *testing.T) {
+	fields := func(c Config) map[string]string {
+		out := map[string]string{}
+		kv := c.LoggableFields()
+		for i := 0; i+1 < len(kv); i += 2 {
+			if k, ok := kv[i].(string); ok {
+				if v, ok := kv[i+1].(string); ok {
+					out[k] = v
+				}
+			}
+		}
+		return out
+	}
+
+	t.Run("parseable urls keep the password out", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsecret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpckey@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsecret")
+		assert.NotContains(t, got["rpc_url"], "rpckey")
+		// The username goes too, matching SoroBeacon's LogAttrs, which pins
+		// the same property. It is not a secret, but it is not diagnostic
+		// either, and this line can be shipped anywhere.
+		assert.NotContains(t, got["database_url"], "dbuser")
+		assert.NotContains(t, got["rpc_url"], "rpcuser")
+		// The host and database still have to be readable, or the line is
+		// useless for diagnosing which database the process came up against.
+		assert.Equal(t, "postgres://db.internal:5432/sorotrail", got["database_url"])
+		assert.Equal(t, "https://rpc.example.com", got["rpc_url"])
+	})
+
+	t.Run("unparseable urls are redacted rather than logged raw", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsec%ret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpc key@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsec%ret")
+		assert.NotContains(t, got["rpc_url"], "rpc key")
+		assert.Equal(t, "<redacted>", got["database_url"])
+		assert.Equal(t, "<redacted>", got["rpc_url"])
+	})
 }

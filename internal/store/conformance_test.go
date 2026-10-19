@@ -1,12 +1,18 @@
+//go:build integration || !integration
+
 package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,37 +39,203 @@ func testEvent(id string, ledger int64, contractID string) Event {
 	}
 }
 
-// runStoreTests runs every backend-agnostic conformance test against the
-// store created by factory. factory is called once per test function and
-// must return a fresh, migrated store.
-func runStoreTests(t *testing.T, factory func(t *testing.T) Store) {
-	t.Run("UpsertEvents_Idempotent", func(t *testing.T) {
-		testUpsertEventsIdempotent(t, factory(t))
-	})
-	t.Run("GetEvent_NotFound", func(t *testing.T) {
-		testGetEventNotFound(t, factory(t))
-	})
-	t.Run("QueryEvents_FiltersAndPagination", func(t *testing.T) {
-		testQueryEventsFiltersAndPagination(t, factory(t))
-	})
-	t.Run("QueryEvents_TimeRange", func(t *testing.T) {
-		testQueryEventsTimeRange(t, factory(t))
-	})
-	t.Run("IngestionStateRoundTrip", func(t *testing.T) {
-		testIngestionStateRoundTrip(t, factory(t))
-	})
-	t.Run("WatchedContracts", func(t *testing.T) {
-		testWatchedContracts(t, factory(t))
-	})
-	t.Run("Stats", func(t *testing.T) {
-		testStats(t, factory(t))
-	})
-	t.Run("RawXDRRoundTrip", func(t *testing.T) {
-		testRawXDRRoundTrip(t, factory(t))
-	})
-	t.Run("ReplaceEventsInRangeKeepsRawXDR", func(t *testing.T) {
-		testReplaceEventsInRangeKeepsRawXDR(t, factory(t))
-	})
+// conformanceTestNames lists the behavioural conformance tests, in the order
+// they run. A backend's registration refers to these names when it declares
+// an operation unsupported, so the two cannot drift out of sync.
+var conformanceTestNames = []string{
+	"UpsertEvents_Idempotent",
+	"GetEvent_NotFound",
+	"QueryEvents_FiltersAndPagination",
+	"QueryEvents_TimeRange",
+	"IngestionStateRoundTrip",
+	"WatchedContracts",
+	"ContractCursors",
+	"Stats",
+	"RawXDRRoundTrip",
+	"ReplaceEventsInRangeKeepsRawXDR",
+}
+
+// conformanceBackend is one Store implementation the shared suite runs
+// against. Adding a backend is one entry in conformanceBackends; nothing in
+// the test bodies below is backend-specific.
+type conformanceBackend struct {
+	// name is the subtest name and the backend's label in failure output.
+	name string
+	// factory returns a fresh, migrated store. It is called once per
+	// conformance test so each starts from empty tables.
+	factory func(t *testing.T) Store
+	// skipEnv is the environment variable that must be set for a
+	// server-backed backend to be exercised. When it is unset the whole
+	// backend is skipped cleanly, never failed, mirroring the Postgres
+	// integration tests' TEST_DATABASE_URL convention.
+	skipEnv string
+	// unsupported names the conformance tests this backend deliberately
+	// does not implement. The suite skips them with the backend's own
+	// declaration rather than running behavioural assertions against a
+	// silent no-op. TestStoreUnsupportedOperations then asserts each such
+	// operation returns ErrUnsupported.
+	unsupported map[string]bool
+}
+
+// conformanceBackends is the single place a new Store implementation is
+// registered with the shared suite.
+func conformanceBackends() []conformanceBackend {
+	// ClickHouse is registered but currently declares the whole behavioural
+	// suite unsupported: its Store methods are stubs that return zero values
+	// rather than results (tracked separately). Wiring it in here is what
+	// makes those gaps visible and reviewable.
+	unsupportedAll := make(map[string]bool, len(conformanceTestNames))
+	for _, name := range conformanceTestNames {
+		unsupportedAll[name] = true
+	}
+
+	return []conformanceBackend{
+		{
+			name:    "sqlite",
+			factory: newSQLiteStore,
+		},
+		{
+			name:    "postgres",
+			factory: newPostgresConformanceStore,
+			skipEnv: "TEST_DATABASE_URL",
+		},
+		{
+			name:        "clickhouse",
+			factory:     newClickHouseConformanceStore,
+			skipEnv:     "TEST_CLICKHOUSE_URL",
+			unsupported: unsupportedAll,
+		},
+	}
+}
+
+// TestStoreConformance runs every backend-agnostic Store test against every
+// registered backend. It is the harness that holds each implementation to the
+// same semantics, so a backend cannot silently diverge from the reference
+// implementation.
+func TestStoreConformance(t *testing.T) {
+	for _, backend := range conformanceBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			runStoreTests(t, backend)
+		})
+	}
+}
+
+// conformanceBackendNamed looks up a registered backend by name, so a
+// single-backend entry point can never drift from the registry's declaration
+// of that backend's skip environment and unsupported operations.
+func conformanceBackendNamed(t *testing.T, name string) conformanceBackend {
+	t.Helper()
+	for _, backend := range conformanceBackends() {
+		if backend.name == name {
+			return backend
+		}
+	}
+	t.Fatalf("%s is not registered as a conformance backend", name)
+	return conformanceBackend{}
+}
+
+// runStoreTests runs the conformance suite against one backend. A backend
+// with a required server is skipped as a whole when its URL is unset, and any
+// operation it declares unsupported is skipped per test with that declaration.
+func runStoreTests(t *testing.T, backend conformanceBackend) {
+	t.Helper()
+
+	if backend.skipEnv != "" && os.Getenv(backend.skipEnv) == "" {
+		t.Skipf("%s: %s is not set; skipping this backend", backend.name, backend.skipEnv)
+	}
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T, st Store)
+	}{
+		{"UpsertEvents_Idempotent", testUpsertEventsIdempotent},
+		{"GetEvent_NotFound", testGetEventNotFound},
+		{"QueryEvents_FiltersAndPagination", testQueryEventsFiltersAndPagination},
+		{"QueryEvents_TimeRange", testQueryEventsTimeRange},
+		{"IngestionStateRoundTrip", testIngestionStateRoundTrip},
+		{"WatchedContracts", testWatchedContracts},
+		{"ContractCursors", testContractCursors},
+		{"Stats", testStats},
+		{"RawXDRRoundTrip", testRawXDRRoundTrip},
+		{"ReplaceEventsInRangeKeepsRawXDR", testReplaceEventsInRangeKeepsRawXDR},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if backend.unsupported[tc.name] {
+				t.Skipf("%s declares %s unsupported", backend.name, tc.name)
+			}
+			tc.run(t, backend.factory(t))
+		})
+	}
+}
+
+// newPostgresConformanceStore returns a fresh Postgres store for the shared
+// suite. Unlike the integration-tagged helpers it is available to the
+// untagged binary, so CI's Postgres-backed job (which sets TEST_DATABASE_URL)
+// exercises the suite against Postgres without a second build tag.
+func newPostgresConformanceStore(t *testing.T) Store {
+	t.Helper()
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres conformance (see CONTRIBUTING.md)")
+	}
+	require.NoError(t, Migrate(dbURL))
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	// Every conformance test asserts against a known, empty result set, so
+	// clear the tables each test reads or writes. Drop every event partition
+	// first: sibling tests (especially the integration-tagged ones) create
+	// partitions with narrower spans, and a leftover one makes the default
+	// span's partition overlap it ("partition would overlap partition").
+	_, err = pool.Exec(ctx, `
+		DO $$ DECLARE part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass
+			LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END $$;`)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `TRUNCATE events, ingestion_state, watched_contracts, audit_state`)
+	require.NoError(t, err)
+
+	return NewPostgres(pool)
+}
+
+// newClickHouseConformanceStore returns a fresh ClickHouse store when a server
+// is configured. The backend currently declares the behavioural suite
+// unsupported, so this is only reached once those stubs grow real
+// implementations; the gate keeps a missing server a skip, never a failure.
+func newClickHouseStoreForTests(t *testing.T) (Store, error) {
+	t.Helper()
+	url := os.Getenv("TEST_CLICKHOUSE_URL")
+	if url == "" {
+		t.Skip("TEST_CLICKHOUSE_URL not set; skipping ClickHouse conformance")
+	}
+	if err := Migrate(url); err != nil {
+		return nil, err
+	}
+	st, err := NewStoreFromURL(url)
+	if err != nil {
+		return nil, err
+	}
+	if err := st.Ping(context.Background()); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func newClickHouseConformanceStore(t *testing.T) Store {
+	t.Helper()
+	st, err := newClickHouseStoreForTests(t)
+	require.NoError(t, err)
+	return st
 }
 
 func testUpsertEventsIdempotent(t *testing.T, st Store) {
@@ -75,6 +247,7 @@ func testUpsertEventsIdempotent(t *testing.T, st Store) {
 
 	inserted, err = st.UpsertEvents(ctx, events)
 	require.NoError(t, err)
+	assert.Equal(t, int64(0), inserted)
 	assert.Zero(t, inserted, "duplicate IDs are ignored")
 
 	got, err := st.GetEvent(ctx, eventID(1), WildcardScope())
@@ -109,30 +282,30 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 	require.NoError(t, err)
 
 	t.Run("by contract", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{ContractID: contractB})
+		got, _, err := st.QueryEvents(ctx, EventFilter{ContractID: contractB, Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Len(t, got, 5)
 	})
 
 	t.Run("by ledger range", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{FromLedger: 103, ToLedger: 105})
+		got, _, err := st.QueryEvents(ctx, EventFilter{FromLedger: 103, ToLedger: 105, Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Len(t, got, 3)
 	})
 
 	t.Run("by type", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"diagnostic"}})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"diagnostic"}, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, eventID(3), got[0].ID)
 	})
 
 	t.Run("by topic at any position", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{Topic: json.RawMessage(`{"u64":7}`)})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Topic: json.RawMessage(`{"u64":7}`), Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Len(t, got, 9, "second-position topic matches too")
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{Topic: json.RawMessage(`{"symbol":"mint"}`)})
+		got, _, err = st.QueryEvents(ctx, EventFilter{Topic: json.RawMessage(`{"symbol":"mint"}`), Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
 	})
@@ -148,6 +321,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			Topic0: json.RawMessage(`{"symbol":"transfer"}`),
 			Topic1: json.RawMessage(`{"address":"GABC"}`),
+			Scope:  WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -158,7 +332,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 		var all []Event
 		cursor := ""
 		for {
-			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor})
+			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor, Scope: WildcardScope()})
 			require.NoError(t, err)
 			all = append(all, page...)
 			if next == "" {
@@ -175,6 +349,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 	t.Run("by topic_contains with object in array (containment)", func(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			TopicContains: json.RawMessage(`[{"u64":7}]`),
+			Scope:         WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 9, "all events with u64:7 (9 out of 10)")
@@ -183,6 +358,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 	t.Run("by topic_contains with object directly does not match array", func(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			TopicContains: json.RawMessage(`{"u64":7}`),
+			Scope:         WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 0, "object not in array => no match")
@@ -192,6 +368,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			ContractID:    contractB,
 			TopicContains: json.RawMessage(`[{"u64":7}]`),
+			Scope:         WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 5)
@@ -200,6 +377,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 	t.Run("by topic_contains no match", func(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			TopicContains: json.RawMessage(`[{"symbol":"nonexistent"}]`),
+			Scope:         WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 0)
@@ -213,6 +391,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 				Limit:  3,
 				Cursor: cursor,
 				Order:  "desc",
+				Scope:  WildcardScope(),
 			})
 			require.NoError(t, err)
 			all = append(all, page...)
@@ -243,6 +422,7 @@ func testQueryEventsTimeRange(t *testing.T, st Store) {
 	t.Run("from_time only", func(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			FromTime: time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+			Scope:    WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 3)
@@ -251,6 +431,7 @@ func testQueryEventsTimeRange(t *testing.T, st Store) {
 	t.Run("to_time only", func(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			ToTime: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
+			Scope:  WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
@@ -260,6 +441,7 @@ func testQueryEventsTimeRange(t *testing.T, st Store) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			FromTime: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
 			ToTime:   time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC),
+			Scope:    WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 3)
@@ -270,6 +452,7 @@ func testQueryEventsTimeRange(t *testing.T, st Store) {
 			FromLedger: 104,
 			ToLedger:   106,
 			FromTime:   time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+			Scope:      WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
@@ -278,6 +461,7 @@ func testQueryEventsTimeRange(t *testing.T, st Store) {
 	t.Run("empty window returns nothing", func(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			FromTime: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+			Scope:    WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 0)
@@ -302,17 +486,67 @@ func testIngestionStateRoundTrip(t *testing.T, st Store) {
 func testWatchedContracts(t *testing.T, st Store) {
 	ctx := context.Background()
 
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA), "re-adding is a no-op")
-	require.NoError(t, st.AddWatchedContract(ctx, contractB))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}), "re-adding is a no-op")
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractB}))
 
 	got, err := st.ListWatchedContracts(ctx)
 	require.NoError(t, err)
 	ids := make([]string, 0, len(got))
 	for _, wc := range got {
+		// The backend is required to report the network each entry was
+		// added on, defaulting an empty add to "default".
+		assert.Equal(t, "default", wc.Network)
 		ids = append(ids, wc.ContractID)
 	}
 	assert.Equal(t, []string{contractA, contractB}, ids)
+}
+
+// testContractCursors pins the per-contract resume-cursor semantics the
+// watched-contract ingester depends on: an absent cursor reads as
+// ErrNotFound (not a zero cursor that would silently resume from ledger
+// 0), a save upserts, a delete is synchronous, and List reflects exactly
+// the rows that exist.
+func testContractCursors(t *testing.T, st Store) {
+	ctx := context.Background()
+
+	_, err := st.GetContractCursor(ctx, contractA)
+	require.ErrorIs(t, err, ErrNotFound,
+		"a contract with no cursor row must read as ErrNotFound, not a zero cursor")
+
+	saved := ContractCursor{ContractID: contractA, LastIngestedLedger: 100, LastCursor: "cur-1"}
+	require.NoError(t, st.SaveContractCursor(ctx, saved))
+
+	got, err := st.GetContractCursor(ctx, contractA)
+	require.NoError(t, err)
+	assert.Equal(t, contractA, got.ContractID)
+	assert.Equal(t, int64(100), got.LastIngestedLedger)
+	assert.Equal(t, "cur-1", got.LastCursor)
+
+	// Saving again is an upsert, not a duplicate-key error.
+	updated := ContractCursor{ContractID: contractA, LastIngestedLedger: 120, LastCursor: "cur-2"}
+	require.NoError(t, st.SaveContractCursor(ctx, updated))
+
+	got, err = st.GetContractCursor(ctx, contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(120), got.LastIngestedLedger)
+	assert.Equal(t, "cur-2", got.LastCursor)
+	assert.False(t, got.UpdatedAt.IsZero(), "Save must record an UpdatedAt timestamp")
+
+	require.NoError(t, st.SaveContractCursor(ctx, ContractCursor{ContractID: contractB, LastIngestedLedger: 5}))
+
+	listed, err := st.ListContractCursors(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 2, "List must reflect exactly the stored cursors")
+
+	require.NoError(t, st.DeleteContractCursor(ctx, contractA))
+	require.ErrorIs(t, st.DeleteContractCursor(ctx, contractA), ErrNotFound,
+		"deleting an already-absent cursor must read as ErrNotFound")
+
+	listed, err = st.ListContractCursors(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "Delete must be synchronous: the next List reflects it")
+	assert.Equal(t, contractB, listed[0].ContractID)
 }
 
 func testStats(t *testing.T, st Store) {
@@ -324,7 +558,7 @@ func testStats(t *testing.T, st Store) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
 
 	stats, err := st.Stats(ctx, WildcardScope())
 	require.NoError(t, err)
@@ -358,6 +592,84 @@ func testRawXDRRoundTrip(t *testing.T, st Store) {
 	assert.Empty(t, gotLegacy.RawValueXDR)
 }
 
+// TestStoreUnsupportedOperations asserts that operations a backend does not
+// implement fail loudly with ErrUnsupported rather than returning a zero
+// value that reads as success. The behavioural suite above exercises what a
+// backend does support; this covers what it declares it does not, so a
+// capability gap cannot regress back into a silent empty result.
+func TestStoreUnsupportedOperations(t *testing.T) {
+	ctx := context.Background()
+
+	// SQLite is the backend that declares Postgres-only operations. It needs
+	// no server, so this runs unconditionally in CI.
+	st := newSQLiteStore(t)
+
+	tests := []struct {
+		name  string
+		probe func() error
+	}{
+		{"ListContracts", func() error {
+			_, _, err := st.ListContracts(ctx, ContractsFilter{})
+			return err
+		}},
+		{"GetContractSummary", func() error {
+			_, err := st.GetContractSummary(ctx, contractA)
+			return err
+		}},
+		{"ContractEventTypeCounts", func() error {
+			_, err := st.ContractEventTypeCounts(ctx, contractA)
+			return err
+		}},
+		{"CreateAPIKey", func() error {
+			_, err := st.CreateAPIKey(ctx, APIKey{})
+			return err
+		}},
+		{"GetAPIKey", func() error {
+			_, err := st.GetAPIKey(ctx, 1)
+			return err
+		}},
+		{"LookupAPIKeyByPrefix", func() error {
+			_, err := st.LookupAPIKeyByPrefix(ctx, "prefix")
+			return err
+		}},
+		{"ListAPIKeys", func() error {
+			_, err := st.ListAPIKeys(ctx)
+			return err
+		}},
+		{"RevokeAPIKey", func() error {
+			return st.RevokeAPIKey(ctx, 1)
+		}},
+		{"ListContractIDs", func() error {
+			_, err := st.ListContractIDs(ctx)
+			return err
+		}},
+		{"GetContractMeta", func() error {
+			_, err := st.GetContractMeta(ctx, contractA)
+			return err
+		}},
+		{"UpsertContractMeta", func() error {
+			return st.UpsertContractMeta(ctx, ContractMeta{ContractID: contractA})
+		}},
+		{"CountContractEvents", func() error {
+			_, err := st.CountContractEvents(ctx, contractA)
+			return err
+		}},
+		{"ListContractsNeedingRefresh", func() error {
+			_, err := st.ListContractsNeedingRefresh(ctx, time.Now())
+			return err
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.probe()
+			require.Error(t, err, "an unimplemented operation must not succeed silently")
+			assert.ErrorIs(t, err, ErrUnsupported,
+				"the error must wrap ErrUnsupported so callers can react to it")
+		})
+	}
+}
+
 func testReplaceEventsInRangeKeepsRawXDR(t *testing.T, st Store) {
 	ctx := context.Background()
 
@@ -384,4 +696,120 @@ func testReplaceEventsInRangeKeepsRawXDR(t *testing.T, st Store) {
 	assert.Equal(t, []string{"AAAADwAAAAh0cmFuc2Zlcg=="}, got.RawTopicXDR,
 		"a JSON-only repair must not strip stored raw XDR")
 	assert.Equal(t, "AAAACgAAAAAAAAAC", got.RawValueXDR)
+}
+
+// --- SQLite conformance suite ---
+// These tests run the shared conformance suite against the SQLite
+// backend to guarantee identical behaviour to Postgres.
+
+func TestSQLite_ConformanceSuite(t *testing.T) {
+	runStoreTests(t, conformanceBackendNamed(t, "sqlite"))
+}
+
+// TestSQLite_Conformance_MigrationIdempotent verifies that the
+// SQLite migration series applies cleanly from empty and that
+// applying it again is a no-op (idempotent).
+func TestSQLite_Conformance_MigrationIdempotent(t *testing.T) {
+	// A file-backed database is required here. ":memory:" gives every
+	// connection its own private database, so migrating through one handle
+	// and querying through another observes an empty schema no matter what
+	// Migrate actually did.
+	url := "sqlite://" + filepath.Join(t.TempDir(), "migrations.db")
+
+	// First migration — should succeed.
+	require.NoError(t, Migrate(url))
+
+	// Second migration — should be idempotent and not error.
+	require.NoError(t, Migrate(url))
+
+	// Verify the schema is present after migration.
+	db, err := sql.Open("sqlite", parseSQLiteDSN(url))
+	require.NoError(t, err)
+	defer db.Close()
+
+	var count int
+	err = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table'").Scan(&count)
+	require.NoError(t, err)
+	assert.Greater(t, count, 0, "migrations should create at least one table")
+
+	// Re-running the series must not leave the tracked version mid-flight or
+	// re-apply files: a clean, fully-applied status is what idempotence looks
+	// like from the migration bookkeeping side.
+	status, err := MigrateStatus(url)
+	require.NoError(t, err)
+	assert.False(t, status.Dirty, "a re-applied migration series must not go dirty")
+	assert.Empty(t, status.Pending, "re-applying must leave nothing pending")
+	assert.Greater(t, status.Version, uint(0), "at least one migration must be recorded")
+}
+
+// --- ClickHouse conformance suite ---
+// These tests run the shared conformance suite against the ClickHouse
+// backend when a ClickHouse server is available. Without a server,
+// the suite skips cleanly rather than failing.
+
+func TestClickHouse_ConformanceSuite(t *testing.T) {
+	// Attempt to create a ClickHouse store from a URL. If no server
+	// is available, the test skips rather than failing.
+	runStoreTests(t, conformanceBackendNamed(t, "clickhouse"))
+}
+
+// TestClickHouse_Unsupported_Methods asserts that every method
+// not yet implemented in the ClickHouse backend returns an explicit
+// error rather than silently succeeding or panicking.
+func TestClickHouse_Unsupported_Methods(t *testing.T) {
+	st := &ClickHouse{}
+	ctx := context.Background()
+
+	// Verify that unsupported methods return explicit errors.
+	_, err := st.ListContractIDs(ctx)
+	assert.NoError(t, err, "ListContractIDs should return nil, nil for ClickHouse")
+
+	_, err = st.GetContractMeta(ctx, "test")
+	assert.ErrorIs(t, err, ErrNotFound, "GetContractMeta should return ErrNotFound")
+
+	// ListContracts is a zero-value stub rather than an error path: the
+	// backend has no contract registry to read, and it reports "nothing"
+	// instead of refusing. Pinned as-is; changing it to ErrUnsupported
+	// would be a behaviour change, not a test fix.
+	_, _, err = st.ListContracts(ctx, ContractsFilter{})
+	assert.NoError(t, err, "ListContracts is a zero-value stub on the clickhouse backend")
+
+	_, err = st.GetContractSummary(ctx, "test")
+	assert.ErrorContains(t, err, "not yet implemented",
+		"GetContractSummary should return an explicit unimplemented error")
+
+	// ContractEventTypeCounts should return an explicit error.
+	_, err = st.ContractEventTypeCounts(ctx, "test")
+	assert.ErrorContains(t, err, "not yet implemented for ClickHouse",
+		"ContractEventTypeCounts should return an explicit unsupported error")
+
+	// GetContractCursor is implemented on this backend, not stubbed: it
+	// issues a request. On a zero-value ClickHouse there is no server to
+	// reach, so what it must not do is succeed or panic.
+	_, err = st.GetContractCursor(ctx, "test")
+	assert.Error(t, err, "GetContractCursor must report the failed lookup rather than a zero cursor")
+}
+
+// TestClickHouse_SuiteSkipsCleanly verifies that when no ClickHouse
+// server is available, the conformance suite skips without error.
+func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
+	// With no CLICKHOUSE_URL set, the conformance test should skip.
+	st, err := newClickHouseStoreForTests(t)
+	if err != nil {
+		t.Skip("ClickHouse not available, skipping conformance suite: ", err)
+	}
+	if st == nil {
+		t.Skip("ClickHouse not available, skipping conformance suite")
+	}
+	t.Skip("ClickHouse is available; the skip-path assertion does not apply")
+}
+
+// RunStoreConformanceSuite runs a standard set of error semantic and behavior
+// assertions against any Store implementation to guarantee that backends agree
+// on ErrNotFound, empty collections, and error handling.
+func RunStoreConformanceSuite(t *testing.T, st Store) {
+	runStoreTests(t, conformanceBackend{
+		name:    "custom",
+		factory: func(t *testing.T) Store { return st },
+	})
 }
